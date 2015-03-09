@@ -12,6 +12,8 @@
 #define PROXY_BUFFER_SIZE   1024
 
 static int proxy_context_pair_delete(EV_P_ proxy_context *ctx);
+static void proxy_state_transition(EV_P_ proxy_context *ctx);
+
 static void connect_callback(EV_P_ ev_io *watcher, int revents);
 static void available_callback(EV_P_ ev_io *watcher, int revents);
 static void read_available_callback(EV_P_ ev_io *watcher, int revents);
@@ -104,6 +106,51 @@ static void connect_callback(EV_P_ ev_io *watcher, int revents) {
     ev_io_start(loop, &ctx->dest->io);
 }
 
+static void proxy_state_transition(EV_P_ proxy_context *ctx) {
+    if(fifobuf_amount(ctx->buf)) {          /*  There is data to send.  */
+        if(EV_WRITE & ctx->io.events) {
+            /*  do nothing  */
+        } else {                            /*  write not enabled   */
+            syslog(LOG_DEBUG, "request sending...");
+            assert(0 <= ctx->io.fd);
+            ev_io_stop(loop, &ctx->io);
+            ev_io_set(&ctx->io, ctx->io.fd, ctx->io.events | EV_WRITE);
+            ev_io_start(loop, &ctx->io);
+        }
+    } else {                                /*  There is no data to send.   */
+        if(EV_WRITE & ctx->io.events) {     /*  write enabled   */
+            syslog(LOG_DEBUG, "Buffer empty. Sending paused.");
+            assert(0 <= ctx->io.fd);
+            ev_io_stop(loop, &ctx->io);
+            ev_io_set(&ctx->io, ctx->io.fd, ctx->io.events & ~EV_WRITE);
+            ev_io_start(loop, &ctx->io);
+        } else {
+            /*  do nothing  */
+        }
+    }
+    if(fifobuf_capacity(ctx->buf)) {            /*  There is space to receive data. */
+        if(EV_READ & ctx->dest->io.events) {
+            /*  do nothing  */
+        } else {                                /*  receive not enabled */
+            syslog(LOG_DEBUG, "allow receiving...");
+            assert(0 <= ctx->dest->io.fd);
+            ev_io_stop(loop, &ctx->dest->io);
+            ev_io_set(&ctx->dest->io, ctx->dest->io.fd, ctx->dest->io.events | EV_READ);
+            ev_io_start(loop, &ctx->dest->io);
+        }
+    } else {                                    /*  There is no space to receive data.  */
+        if(EV_READ & ctx->dest->io.events) {    /*  receive enabled */
+            syslog(LOG_DEBUG, "Buffer full. Receiving paused.");
+            assert(0 <= ctx->dest->io.fd);
+            ev_io_stop(loop, &ctx->dest->io);
+            ev_io_set(&ctx->dest->io, ctx->dest->io.fd, ctx->dest->io.events & ~EV_READ);
+            ev_io_start(loop, &ctx->dest->io);
+        } else {
+            /*  do nothing  */
+        }
+    }
+}
+
 static void available_callback(EV_P_ ev_io *watcher, int revents) {
     if(EV_READ & revents)
         read_available_callback(loop, watcher, revents);
@@ -137,24 +184,9 @@ static void write_available_callback(EV_P_ ev_io *watcher, int revents) {
             proxy_context_pair_delete(loop, ctx);
             return;
         }
-
-        syslog(LOG_DEBUG, "Buffer empty. Sending paused.");
-        ev_io_stop(loop, watcher);
-        ev_io_set(watcher, watcher->fd, watcher->events & ~EV_WRITE);
-        ev_io_start(loop, watcher);
-
     }
 
-    if(
-        (fifobuf_capacity(ctx->buf) > 0)
-        && (0 == (EV_READ & ctx->dest->io.events))
-      ){
-        syslog(LOG_DEBUG, "allow receiving...");
-        ev_io_stop(loop, &ctx->dest->io);
-        ev_io_set(&ctx->dest->io, ctx->dest->io.fd, EV_READ|ctx->dest->io.events);
-        ev_io_start(loop, &ctx->dest->io);
-    }
-
+    proxy_state_transition(loop, ctx);
     assert(0 == fifobuf_amount(ctx->buf) || (EV_READ & ctx->dest->io.events));  /*  lock out condition  */
 }
 
@@ -179,22 +211,10 @@ static void read_available_callback(EV_P_ ev_io *watcher, int revents) {
             fifobuf_push_back(ctx->dest->buf, NULL, nread);
         }
     } else {
-        syslog(LOG_DEBUG, "Buffer full. Receiving paused.");
-        ev_io_stop(loop, watcher);
-        ev_io_set(watcher, watcher->fd, watcher->events & ~EV_READ);
-        ev_io_start(loop, watcher);
+        /*  do nothing  */
     }
 
-    if(
-        (fifobuf_amount(ctx->dest->buf) > 0)
-        && (0 == (EV_WRITE & ctx->dest->io.events))
-      ) {
-        syslog(LOG_DEBUG, "request sending...");
-        ev_io_stop(loop, &ctx->dest->io);
-        ev_io_set(&ctx->dest->io, ctx->dest->io.fd, EV_WRITE|ctx->dest->io.events);
-        ev_io_start(loop, &ctx->dest->io);
-    }
-
+    proxy_state_transition(loop, ctx->dest);
     assert(fifobuf_capacity(ctx->dest->buf) || (EV_WRITE & ctx->dest->io.events));  /*  lock out condition  */
 }
 
