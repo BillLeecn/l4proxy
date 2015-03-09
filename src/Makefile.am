@@ -1,6 +1,10 @@
 AM_CFLAGS = -I$(top_srcdir)/libev
 
-#AM_LDFLAGS = -static
+if DEBUG
+    AM_CFLAGS += -O0 -g
+else
+    AM_CFLAGS += -O3 -DNDEBUG
+endif
 
 noinst_LIBRARIES = libev.a
 libev_a_SOURCES = $(top_srcdir)/libev/ev.c
