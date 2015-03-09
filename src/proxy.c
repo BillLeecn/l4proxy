@@ -165,15 +165,16 @@ static void write_available_callback(EV_P_ ev_io *watcher, int revents) {
     if(fifobuf_amount(ctx->buf) > 0) {
         ssize_t nwrite;
         if(-1 == (nwrite = write(ctx->io.fd, fifobuf_buf(ctx->buf), fifobuf_amount(ctx->buf))) ) {
-            if(EAGAIN != errno && EWOULDBLOCK != errno){
-                proxy_context_pair_delete(loop, ctx);
-                return;
-            } else if(EPIPE == errno) {
+            if(EPIPE == errno) {
                 syslog(LOG_DEBUG, "connection closed");
                 connect_closed_callback(loop, watcher, revents);
                 return;
+            } else if(EAGAIN == errno || EWOULDBLOCK == errno){
+                /*  do nothing  */
+            } else {
+                proxy_context_pair_delete(loop, ctx);
+                return;
             }
-            /* else do nothing */
         } else {
             syslog(LOG_DEBUG, "sending data...");
             fifobuf_pop_front(ctx->buf, NULL, nwrite);
