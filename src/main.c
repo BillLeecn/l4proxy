@@ -1,5 +1,5 @@
 /*
- * main.c - lay-4 proxy main module
+ * main.c - layer-4 proxy main module
  *
  * Copyright (c) 2015 Yang Li. All rights reserved.
  *

@@ -1,3 +1,12 @@
+/*
+ * proxy.c - layer-4 proxy proxy context module
+ *
+ * Copyright (c) 2015 Yang Li. All rights reserved.
+ *
+ * This program may be distributed according to the terms of the GNU
+ * General Public License, version 3 or (at your option) any later version.
+ */
+
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
