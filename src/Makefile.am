@@ -13,4 +13,8 @@ bin_PROGRAMS = l4proxyd
 l4proxyd_SOURCES = main.c daemon.c proxy.c fifobuf.c \
                    backends/backend.c backends/redirect.c
 l4proxyd_LDADD = libev.a
-l4proxyd_CFLAGS = $(AM_CFLAGS) -Wall -Werror -Wno-error=strict-aliasing -Wno-error=unused-result
+l4proxyd_CFLAGS = $(AM_CFLAGS) -Wall
+
+if DEBUG
+l4proxyd_CFLAGS += -Werror -Wno-error=strict-aliasing -Wno-error=unused-result
+endif
