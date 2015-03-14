@@ -222,12 +222,12 @@ static void accept_callback(EV_P_ ev_io *watcher, int revents) {
         }
     }
 
-    proxy_context *ctx = NULL;
-    if(-1 == proxy_context_pair_new(&ctx, clientfd, destfd)) {
+    ProxyContext *ctx = NULL;
+    if(-1 == proxy_context_new(&ctx, clientfd, destfd)) {
         syslog(LOG_ERR, "Couldn't create proxy context!");
         close_i(clientfd);
         close_i(destfd);
         return;
     }
-    proxy_context_pair_start(loop, ctx);
+    proxy_context_start(loop, ctx);
 }

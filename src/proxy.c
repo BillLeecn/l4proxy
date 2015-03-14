@@ -1,247 +1,276 @@
 #include <assert.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <errno.h>
 #include <syslog.h>
+#include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 
+#include <ev.h>
+
 #include "utils.h"
+#include "fifobuf.h"
 #include "proxy.h"
 
-#define PROXY_BUFFER_SIZE   1024
+#define PROXY_BUFFER_SIZE   2048
 
-static int proxy_context_pair_delete(EV_P_ proxy_context *ctx);
-static void proxy_state_transition(EV_P_ proxy_context *ctx);
+typedef struct read_context_t ReadContext;
+typedef struct write_context_t WriteContext;
+
+struct read_context_t {
+    ev_io           io;
+    fifobuf_t       *buf;
+    WriteContext    *dst;
+    ProxyContext    *proxy;
+    int             connected;
+};
+
+struct write_context_t {
+    ev_io           io;
+    fifobuf_t       *buf;
+    ReadContext     *src;
+    ProxyContext    *proxy;
+    int             connected;
+};
+
+struct proxy_context_t {
+    ReadContext     client_read_ctx;
+    WriteContext    client_write_ctx;
+    ReadContext     remote_read_ctx;
+    WriteContext    remote_write_ctx;
+};
+
+static int proxy_context_delete(EV_P_ ProxyContext *ctx);
+static void state_transist(EV_P_ ProxyContext *ctx);
+
+static void read_callback(EV_P_ ev_io *watcher, int revents);
+static void write_callback(EV_P_ ev_io *watcher, int revents);
 
 static void connect_callback(EV_P_ ev_io *watcher, int revents);
-static void available_callback(EV_P_ ev_io *watcher, int revents);
-static void read_available_callback(EV_P_ ev_io *watcher, int revents);
-static void write_available_callback(EV_P_ ev_io *watcher, int revents);
-static void connect_closed_callback(EV_P_ ev_io *watcher, int revents);
+static void disconnect_callback(EV_P_ ev_io *watcher, int revents);
 
-int proxy_context_pair_new(proxy_context **pctx, int fd0, int fd1) {
-    proxy_context *ctx = (proxy_context*)malloc(2*sizeof(proxy_context));
-    if(ctx == NULL) {
-        syslog(LOG_ERR, "malloc: %m");
+int proxy_context_new(ProxyContext **pctx, int fd0, int fd1) {
+    ProxyContext *ctx = (ProxyContext*)malloc(sizeof(ProxyContext));
+    if(NULL == ctx) {
+        syslog(LOG_ERR, "malloc failed");
+        *pctx = NULL;
         return -1;
     }
-    ev_io_init((ev_io*)ctx, NULL, fd0, 0);
-    ev_io_init((ev_io*)(ctx+1), NULL, fd1, 0);
+    memset(ctx, 0, sizeof(ProxyContext));
 
-    ctx[0].dest = ctx+1;
-    ctx[0].buf = NULL;
-    ctx[1].dest = ctx;
-    ctx[1].buf = NULL;
+    ctx->client_read_ctx.dst = &ctx->remote_write_ctx;
+    ctx->client_write_ctx.src = &ctx->remote_read_ctx;
+    ctx->remote_read_ctx.dst = &ctx->client_write_ctx;
+    ctx->remote_write_ctx.src = &ctx->client_read_ctx;
+
+    ctx->client_read_ctx.proxy = ctx;
+    ctx->client_write_ctx.proxy = ctx;
+    ctx->remote_read_ctx.proxy = ctx;
+    ctx->remote_write_ctx.proxy = ctx;
+
+    ev_io_init(&ctx->client_read_ctx.io, &read_callback, fd0, EV_READ);
+    ev_io_init(&ctx->client_write_ctx.io, &write_callback, fd0, EV_WRITE);
+    ev_io_init(&ctx->remote_read_ctx.io, &read_callback, fd1, EV_READ);
+    ev_io_init(&ctx->remote_write_ctx.io, &write_callback, fd1, EV_WRITE);
 
     *pctx = ctx;
     return 0;
 }
 
-static int proxy_context_pair_delete(EV_P_ proxy_context *ctx) {
+int proxy_context_start(EV_P_ ProxyContext *ctx) {
+    ctx->client_read_ctx.connected = 1;
+    ctx->client_write_ctx.connected = 1;
 
-    if(ctx->io.fd >= 0) {
-        ev_io_stop(loop, &ctx->io);
-        close_i(ctx->io.fd);
-    }
-    if(ctx->dest->io.fd >= 0) {
-        ev_io_stop(loop, &ctx->dest->io);
-        close_i(ctx->dest->io.fd);
-    }
-
-    if(ctx->buf)
-        fifobuf_delete(ctx->buf);
-    if(ctx->dest->buf)
-        fifobuf_delete(ctx->dest->buf);
-
-    if(ctx->dest < ctx)
-        free(ctx->dest);
-    else
-        free(ctx);
-
+    assert(EV_WRITE & ctx->remote_write_ctx.io.events);
+    ev_io_start(loop, &ctx->remote_write_ctx.io);
     return 0;
 }
 
-int proxy_context_pair_start(EV_P_ proxy_context *ctx) {
-    /*  wait for nonblocking connect(2) */
-    ev_io_init(&ctx[1].io, connect_callback, ctx[1].io.fd, EV_WRITE);
-    ev_io_start(loop, &ctx[1].io);
-    return 0;
+static void read_callback(EV_P_ ev_io *watcher, int revents) {
+    ReadContext *ctx = (ReadContext*)watcher;
+    ProxyContext *proxy = ctx->proxy;
+
+    ssize_t nread;
+    if(-1 == (nread = read(ctx->io.fd, fifobuf_space(ctx->buf), fifobuf_capacity(ctx->buf))) ) {
+        if(EAGAIN == errno || EWOULDBLOCK == errno) {
+            /*  do nothing  */
+        } else {
+            syslog(LOG_ERR, "<%p> read: %m", proxy);
+            proxy_context_delete(loop, proxy);
+            return;
+        }
+    } else if(0 == nread) {
+        disconnect_callback(loop, watcher, revents);
+        return;
+    } else {
+        fifobuf_push_back(ctx->buf, NULL, nread);
+        state_transist(loop, proxy);
+    }
+}
+
+static void write_callback(EV_P_ ev_io *watcher, int revents) {
+    WriteContext *ctx = (WriteContext*)watcher;
+    ProxyContext *proxy = ctx->proxy;
+
+    if(!ctx->connected) {
+        connect_callback(loop, watcher, revents);
+        return;
+    }
+
+    ssize_t nwrite;
+    if(-1 == (nwrite = write(ctx->io.fd, fifobuf_buf(ctx->buf), fifobuf_amount(ctx->buf))) ) {
+        if(EPIPE == errno) {
+            disconnect_callback(loop, watcher, revents);
+            return;
+        } else if(EAGAIN == errno || EWOULDBLOCK == errno) {
+            /*  do nothing  */
+        } else {
+            syslog(LOG_ERR, "<%p> write: %m", proxy);
+            proxy_context_delete(loop, proxy);
+            return;
+        }
+    } else {
+        fifobuf_pop_front(ctx->buf, NULL, nwrite);
+        state_transist(loop, proxy);
+    }
 }
 
 static void connect_callback(EV_P_ ev_io *watcher, int revents) {
-    assert(EV_WRITE & revents);
-
-    ev_io_stop(loop, watcher);
-    proxy_context *ctx = (proxy_context*)watcher;
+    WriteContext *ctx = (WriteContext*)watcher;
+    ProxyContext *proxy = ctx->proxy;
 
     int err = 0;
     socklen_t errlen = sizeof(err);
     if(-1 == getsockopt(watcher->fd, SOL_SOCKET, SO_ERROR, &err, &errlen)) {
-        syslog(LOG_ERR, "getsockopt: %m");
-        proxy_context_pair_delete(loop, ctx);
+        syslog(LOG_ERR, "<%p> getsockopt: %m", proxy);
+        proxy_context_delete(loop, proxy);
         return;
     }
     if(err) {
-        syslog(LOG_INFO, "connect: %m");
-        proxy_context_pair_delete(loop, ctx);
+        syslog(LOG_INFO, "<%p> connect: %s", proxy, strerror(err));
+        proxy_context_delete(loop, proxy);
         return;
     }
 
-    syslog(LOG_DEBUG, "connect_callback: remote connected.");
-    if(NULL == (ctx->buf = fifobuf_new(PROXY_BUFFER_SIZE)) ) {
+    proxy->remote_read_ctx.connected = 1;
+    proxy->remote_write_ctx.connected = 1;
+    syslog(LOG_DEBUG, "<%p> connect_callback: remote connected", proxy);
+    if(NULL == (proxy->client_read_ctx.buf = proxy->remote_write_ctx.buf = fifobuf_new(PROXY_BUFFER_SIZE)) ) {
         syslog(LOG_ERR, "fifobuf_new failed! Cleaning up...");
-        proxy_context_pair_delete(loop, ctx);
         return;
     }
-    if(NULL == (ctx->dest->buf = fifobuf_new(PROXY_BUFFER_SIZE)) ) {
+    if(NULL == (proxy->client_write_ctx.buf = proxy->remote_read_ctx.buf = fifobuf_new(PROXY_BUFFER_SIZE)) ) {
         syslog(LOG_ERR, "fifobuf_new failed! Cleaning up...");
-        proxy_context_pair_delete(loop, ctx);
         return;
     }
 
-    ev_io_init(&ctx->io, available_callback, ctx->io.fd, EV_READ);                 /*  remote side */
-    ev_io_start(loop, &ctx->io);
-    ev_io_init(&ctx->dest->io, available_callback, ctx->dest->io.fd, EV_READ);     /*  client side */
-    ev_io_start(loop, &ctx->dest->io);
+    ev_io_start(loop, &proxy->client_read_ctx.io);
+    ev_io_start(loop, &proxy->remote_read_ctx.io);
+    ev_io_stop(loop, &proxy->remote_write_ctx.io);
 }
 
-static void proxy_state_transition(EV_P_ proxy_context *ctx) {
-    if(fifobuf_amount(ctx->buf)) {          /*  There is data to send.  */
-        if(EV_WRITE & ctx->io.events) {
-            /*  do nothing  */
-        } else {                            /*  write not enabled   */
-            syslog(LOG_DEBUG, "request sending...");
-            assert(0 <= ctx->io.fd);
-            ev_io_stop(loop, &ctx->io);
-            ev_io_set(&ctx->io, ctx->io.fd, ctx->io.events | EV_WRITE);
-            ev_io_start(loop, &ctx->io);
-        }
-    } else {                                /*  There is no data to send.   */
-        if(EV_WRITE & ctx->io.events) {     /*  write enabled   */
-            syslog(LOG_DEBUG, "Buffer empty. Sending paused.");
-            assert(0 <= ctx->io.fd);
-            ev_io_stop(loop, &ctx->io);
-            ev_io_set(&ctx->io, ctx->io.fd, ctx->io.events & ~EV_WRITE);
-            ev_io_start(loop, &ctx->io);
-        } else {
-            /*  do nothing  */
-        }
+static int proxy_context_delete(EV_P_ ProxyContext *ctx) {
+    ev_io_stop(loop, &ctx->client_read_ctx.io);
+    ev_io_stop(loop, &ctx->client_write_ctx.io);
+    ev_io_stop(loop, &ctx->remote_read_ctx.io);
+    ev_io_stop(loop, &ctx->remote_write_ctx.io);
+
+    if(ctx->client_read_ctx.connected || ctx->client_write_ctx.connected) {
+        syslog(LOG_DEBUG, "<%p> proxy_context_delete: closing client side...", ctx);
+        close_i(ctx->client_read_ctx.io.fd);
     }
-    if(fifobuf_capacity(ctx->buf)) {            /*  There is space to receive data. */
-        if(EV_READ & ctx->dest->io.events) {
-            /*  do nothing  */
-        } else {                                /*  receive not enabled */
-            syslog(LOG_DEBUG, "allow receiving...");
-            assert(0 <= ctx->dest->io.fd);
-            ev_io_stop(loop, &ctx->dest->io);
-            ev_io_set(&ctx->dest->io, ctx->dest->io.fd, ctx->dest->io.events | EV_READ);
-            ev_io_start(loop, &ctx->dest->io);
-        }
-    } else {                                    /*  There is no space to receive data.  */
-        if(EV_READ & ctx->dest->io.events) {    /*  receive enabled */
-            syslog(LOG_DEBUG, "Buffer full. Receiving paused.");
-            assert(0 <= ctx->dest->io.fd);
-            ev_io_stop(loop, &ctx->dest->io);
-            ev_io_set(&ctx->dest->io, ctx->dest->io.fd, ctx->dest->io.events & ~EV_READ);
-            ev_io_start(loop, &ctx->dest->io);
-        } else {
-            /*  do nothing  */
-        }
+    if(ctx->remote_read_ctx.connected || ctx->remote_write_ctx.connected) {
+        syslog(LOG_DEBUG, "<%p> proxy_context_delete: closing remote side...", ctx);
+        close_i(ctx->remote_read_ctx.io.fd);
     }
+
+    if(ctx->client_read_ctx.buf) {
+        fifobuf_delete(ctx->client_read_ctx.buf);
+    }
+    if(ctx->client_write_ctx.buf) {
+        fifobuf_delete(ctx->client_write_ctx.buf);
+    }
+
+    free(ctx);
+    return 0;
 }
 
-static void available_callback(EV_P_ ev_io *watcher, int revents) {
-    if(EV_READ & revents)
-        read_available_callback(loop, watcher, revents);
-    if(EV_WRITE & revents)
-        write_available_callback(loop, watcher, revents);
-}
+static void disconnect_callback(EV_P_ ev_io *watcher, int revents) {
+    ProxyContext *proxy;
 
-static void write_available_callback(EV_P_ ev_io *watcher, int revents) {
-    syslog(LOG_DEBUG, "ready to send");
-    proxy_context *ctx = (proxy_context*)watcher;
+    if(EV_WRITE & revents) {
+        WriteContext *ctx = (WriteContext*)watcher;
+        proxy = ctx->proxy;
 
-    if(fifobuf_amount(ctx->buf) > 0) {
-        ssize_t nwrite;
-        if(-1 == (nwrite = write(ctx->io.fd, fifobuf_buf(ctx->buf), fifobuf_amount(ctx->buf))) ) {
-            if(EPIPE == errno) {
-                syslog(LOG_DEBUG, "connection closed");
-                connect_closed_callback(loop, watcher, revents);
-                return;
-            } else if(EAGAIN == errno || EWOULDBLOCK == errno){
-                /*  do nothing  */
-            } else {
-                proxy_context_pair_delete(loop, ctx);
-                return;
-            }
-        } else {
-            syslog(LOG_DEBUG, "sending data...");
-            fifobuf_pop_front(ctx->buf, NULL, nwrite);
-        }
+        ctx->connected = 0;
+    } else if (EV_READ & revents) {
+        ReadContext *ctx = (ReadContext*)watcher;
+        proxy = ctx->proxy;
+
+        ctx->connected = 0;
     } else {
-        if(-1 == ctx->dest->io.fd) {
-            syslog(LOG_DEBUG, "All data sent. Closing connection...");
-            proxy_context_pair_delete(loop, ctx);
-            return;
-        }
+        syslog(LOG_CRIT, "disconnect_callback: neither EV_WRITE nore EV_READ is set.");
+        exit(EXIT_FAILURE);
     }
 
-    proxy_state_transition(loop, ctx);
-    assert(0 == fifobuf_amount(ctx->buf) || (EV_READ & ctx->dest->io.events));  /*  lock out condition  */
+    int client_disconnected = !(proxy->client_read_ctx.connected && proxy->client_write_ctx.connected);
+    int remote_disconnected = !(proxy->remote_read_ctx.connected && proxy->remote_write_ctx.connected);
+
+    if(client_disconnected) {
+        syslog(LOG_DEBUG, "<%p> disconnect_callback: client disconnected.", proxy);
+        proxy->client_read_ctx.connected = proxy->client_write_ctx.connected = 0;
+        close_i(proxy->client_read_ctx.io.fd);
+    }
+    if(remote_disconnected) {
+        syslog(LOG_DEBUG, "<%p> disconnect_callback: remote disconnected.", proxy);
+        proxy->remote_read_ctx.connected = proxy->remote_write_ctx.connected = 0;
+        close_i(proxy->remote_read_ctx.io.fd);
+    }
+
+    if(
+        (client_disconnected && remote_disconnected)
+        || (client_disconnected && (0 == fifobuf_amount(proxy->remote_write_ctx.buf)))
+        || (remote_disconnected && (0 == fifobuf_amount(proxy->client_write_ctx.buf)))
+      ) {
+        syslog(LOG_DEBUG, "<%p> disconnect_callback: releasing proxy context.", proxy);
+        proxy_context_delete(loop, proxy);
+        return;
+    }
+
+    state_transist(loop, proxy);
 }
 
-static void read_available_callback(EV_P_ ev_io *watcher, int revents) {
-    syslog(LOG_DEBUG, "data pending...");
-    proxy_context *ctx = (proxy_context*)watcher;
-
-    if(fifobuf_capacity(ctx->dest->buf) > 0) {
-        ssize_t nread;
-        if(-1 == (nread = read(ctx->io.fd, fifobuf_space(ctx->dest->buf), fifobuf_capacity(ctx->dest->buf))) ) {
-            if(EAGAIN != errno && EWOULDBLOCK != errno){
-                proxy_context_pair_delete(loop, ctx);
-                return;
-            }
-            /* else do nothing */
-        } else if(0 == nread) {
-            syslog(LOG_DEBUG, "connection closed");
-            connect_closed_callback(loop, watcher, revents);
-            return;
-        } else {
-            syslog(LOG_DEBUG, "receiving data...");
-            fifobuf_push_back(ctx->dest->buf, NULL, nread);
-        }
+static void state_transist(EV_P_ ProxyContext *ctx) {
+    if(!(ctx->client_read_ctx.connected && ctx->client_read_ctx.dst->connected)) {
+        ev_io_stop(loop, &ctx->client_read_ctx.io);
+    } else if(fifobuf_capacity(ctx->client_read_ctx.buf)) {
+        ev_io_start(loop, &ctx->client_read_ctx.io);
     } else {
-        /*  do nothing  */
+        ev_io_stop(loop, &ctx->client_read_ctx.io);
     }
 
-    proxy_state_transition(loop, ctx->dest);
-    assert(fifobuf_capacity(ctx->dest->buf) || (EV_WRITE & ctx->dest->io.events));  /*  lock out condition  */
-}
-
-static void connect_closed_callback(EV_P_ ev_io *watcher, int revents) {
-    /*  TODO:   handle half-closed connection   */
-    proxy_context *ctx = (proxy_context*)watcher;
-
-    if(-1 == ctx->dest->io.fd){
-        proxy_context_pair_delete(loop, ctx);
-        return;
+    if(!ctx->client_write_ctx.connected) {
+        ev_io_stop(loop, &ctx->client_write_ctx.io);
+    } else if(fifobuf_amount(ctx->client_write_ctx.buf)) {
+        ev_io_start(loop, &ctx->client_write_ctx.io);
+    } else {
+        ev_io_stop(loop, &ctx->client_write_ctx.io);
     }
 
-    ev_io_stop(loop, watcher);
-    close_i(watcher->fd);
-    ev_io_set(watcher, -1, 0);
-
-    if(0 == fifobuf_amount(ctx->dest->buf)) {
-        proxy_context_pair_delete(loop, ctx);
-        return;
+    if(!(ctx->remote_read_ctx.connected && ctx->remote_read_ctx.dst->connected)) {
+        ev_io_stop(loop, &ctx->remote_read_ctx.io);
+    } else if(fifobuf_capacity(ctx->remote_read_ctx.buf)) {
+        ev_io_start(loop, &ctx->remote_read_ctx.io);
+    } else {
+        ev_io_stop(loop, &ctx->remote_read_ctx.io);
     }
-
-    if(ctx->dest->io.events & EV_READ) {
-        ev_io_stop(loop, &ctx->dest->io);
-        ev_io_set(&ctx->dest->io, ctx->dest->io.fd, ctx->dest->io.events & ~EV_READ);
-        ev_io_start(loop, &ctx->dest->io);
+    if(!ctx->remote_write_ctx.connected) {
+        ev_io_stop(loop, &ctx->remote_write_ctx.io);
+    } else if(fifobuf_amount(ctx->remote_write_ctx.buf)) {
+        ev_io_start(loop, &ctx->remote_write_ctx.io);
+    } else {
+        ev_io_stop(loop, &ctx->remote_write_ctx.io);
     }
-
-    assert( (ctx->dest->io.events & EV_WRITE) && fifobuf_amount(ctx->dest->buf) );
 }
